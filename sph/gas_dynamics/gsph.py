@@ -539,3 +539,301 @@ class GSPHAcceleration(Equation):
         result[0] = vij_i2
         result[1] = vij_j2
         result[2] = sstar
+
+class GSPHAcceleration_rel(Equation):
+    """Class to implement the Special-relativistic GSPH accelerations.
+
+    Based on the algorithm in "Special-relativistic Godunov-type Smooth Particle Hydrodynamics (GSPH)"
+    and Inutsuka's original GSPH framework.
+    """
+    def __init__(self, dest, sources, g1=0.0, g2=0.0,
+                 monotonicity=0, rsolver=Exact,
+                 interpolation=Linear, interface_zero=True, hybrid=False,
+                 blend_alpha=5.0, tf=1.0,
+                 gamma=4.0/3.0, chi=1.0, niter=20, tol=1e-6):
+        """
+        Parameters
+        ----------
+        gamma: float
+            Ratio of specific heats (default 4/3 for relativistic gas)
+        chi: float
+            Rest mass density coefficient (from paper Eq. (2c))
+        Other parameters same as original GSPHAcceleration.
+        """
+        self.gamma = gamma
+        self.gamma1 = gamma - 1.0
+        self.chi = chi  # 新增：相对论EOS参数
+        self.niter = niter
+        self.tol = tol
+        self.g1 = g1
+        self.g2 = g2
+        self.monotonicity = monotonicity
+        self.interpolation = interpolation
+        self.rsolver = rsolver
+        self.sstar = 0.0
+        self.thermal_conduction = 1 if (g1 != 0 or g2 != 0) else 0
+        self.interface_zero = interface_zero
+        self.hybrid = hybrid
+        self.blend_alpha = blend_alpha
+        self.tf = tf
+
+        super(GSPHAcceleration_rel, self).__init__(dest, sources)
+
+    def _get_helpers_(self):
+        return HELPERS + [monotonicity_min, sgn]
+
+    def initialize(self, d_idx, d_au, d_av, d_aw, d_ae):
+        d_au[d_idx] = 0.0
+        d_av[d_idx] = 0.0
+        d_aw[d_idx] = 0.0
+        d_ae[d_idx] = 0.0
+
+    def loop(self, d_idx, d_m, d_h, d_D, d_cs, d_div, d_p, d_e_hat, d_grDx,
+             d_grDy, d_grDz, d_u, d_v, d_w, d_qx, d_qy, d_qz, d_px, d_py, d_pz,
+             d_ux, d_uy, d_uz, d_vx, d_vy, d_vz, d_wx, d_wy, d_wz, d_au, d_av,
+             d_aw, d_ae, d_Gamma, d_h_hat,
+             s_idx, s_D, s_m, s_h, s_cs, s_div, s_p, s_e_hat, s_grDx,
+             s_grDy, s_grDz, s_u, s_v, s_w, s_qx, s_qy, s_qz, s_px, s_py, s_pz,
+             s_ux, s_uy, s_uz, s_vx, s_vy, s_vz, s_wx, s_wy, s_wz, s_Gamma, s_h_hat,
+             XIJ, DWIJ, DWI, DWJ, RIJ, RHOIJ, EPS, dt, t):
+        # 1. 新增/修改：相对论核心变量替换
+        blending_factor = exp(-self.blend_alpha*t/self.tf)
+        g1 = self.g1
+        g2 = self.g2
+        hi = d_h[d_idx]
+        hj = s_h[s_idx]
+        eij = declare('matrix(3)')
+        
+        if RIJ < 1e-14:
+            eij[0] = eij[1] = eij[2] = 0.0
+            sij = 1.0/(RIJ + EPS)
+        else:
+            eij[0] = XIJ[0]/RIJ
+            eij[1] = XIJ[1]/RIJ
+            eij[2] = XIJ[2]/RIJ
+            sij = 1.0/RIJ
+
+        # 2. 相对论速度投影（论文Eq. (23a)-(23b)）
+        vl = s_u[s_idx]*eij[0] + s_v[s_idx]*eij[1] + s_w[s_idx]*eij[2]
+        vr = d_u[d_idx]*eij[0] + d_v[d_idx]*eij[1] + d_w[d_idx]*eij[2]
+
+        # 3. 热传导项（保留原逻辑，适配相对论变量）
+        Hi = g1*hi*d_cs[d_idx] + g2*hi*hi*(abs(d_div[d_idx]) - d_div[d_idx])
+
+        # 4. 相对论密度梯度点积（d_grDx=∇D·eij，替换原grho）
+        grDi_dot_eij = d_grDx[d_idx]*eij[0] + d_grDy[d_idx]*eij[1] + d_grDz[d_idx]*eij[2]
+        grDj_dot_eij = s_grDx[s_idx]*eij[0] + s_grDy[s_idx]*eij[1] + s_grDz[s_idx]*eij[2]
+
+        # 5. 比体积积分插值（适配相对论密度D=ρΓ）
+        sp_vol = declare('matrix(3)')
+        self.interpolate(hi, hj, d_D[d_idx], s_D[s_idx], RIJ,
+                         grDi_dot_eij, grDj_dot_eij, sp_vol)
+        vij_i = sp_vol[0]
+        vij_j = sp_vol[1]
+        sstar = sp_vol[2]
+
+        # 6. 局部坐标系梯度（替换原rho梯度为D梯度）
+        rsi = grDi_dot_eij  # ∇D·eij（论文Eq. (42a)）
+        psi = d_px[d_idx]*eij[0] + d_py[d_idx]*eij[1] + d_pz[d_idx]*eij[2]
+        vsi = (eij[0]*eij[0]*d_ux[d_idx] +
+               eij[0]*eij[1]*(d_uy[d_idx] + d_vx[d_idx]) +
+               eij[0]*eij[2]*(d_uz[d_idx] + d_wx[d_idx]) +
+               eij[1]*eij[1]*d_vy[d_idx] +
+               eij[1]*eij[2]*(d_vz[d_idx] + d_wy[d_idx]) +
+               eij[2]*eij[2]*d_wz[d_idx])
+
+        rsj = grDj_dot_eij  # ∇D·eij
+        psj = s_px[s_idx]*eij[0] + s_py[s_idx]*eij[1] + s_pz[s_idx]*eij[2]
+        vsj = (eij[0]*eij[0]*s_ux[s_idx] +
+               eij[0]*eij[1]*(s_uy[s_idx] + s_vx[s_idx]) +
+               eij[0]*eij[2]*(s_uz[s_idx] + s_wx[s_idx]) +
+               eij[1]*eij[1]*s_vy[s_idx] +
+               eij[1]*eij[2]*(s_vz[s_idx] + s_wy[s_idx]) +
+               eij[2]*eij[2]*(s_wz[s_idx]))
+
+        # 7. 相对论核心物理量（论文Eqs. (2a)-(2c)）
+        csi = d_cs[d_idx]
+        csj = s_cs[s_idx]
+        Di = d_D[d_idx]       # 相对论密度D=ρΓ
+        Dj = s_D[s_idx]
+        pi = d_p[d_idx]
+        pj = s_p[s_idx]
+        e_hat_i = d_e_hat[d_idx]  # 总能量密度（含静质量）
+        e_hat_j = s_e_hat[s_idx]
+        Gamma_i = d_Gamma[d_idx]  # 洛伦兹因子Γ=1/√(1-v²)
+        Gamma_j = s_Gamma[s_idx]
+        h_hat_i = d_h_hat[d_idx]  # 相对论焓h=1+ε+p/ρ
+        h_hat_j = s_h_hat[s_idx]
+
+        # 8. 单调性约束（保留原逻辑，变量替换为相对论量）
+        if self.monotonicity == 0:  # First order scheme
+            rsi = rsj = psi = psj = vsi = vsj = 0.0
+
+        if self.monotonicity == 1:  # I02 algorithm
+            if (vsi * vsj) < 0:
+                vsi = vsj = 0.0
+            if (min(csi, csj) < 3.0*(vl - vr)):
+                rsi = rsj = psi = psj = vsi = vsj = 0.0
+
+        if self.monotonicity == 2 and RIJ > 1e-14:  # IwIn algorithm
+            qijD = Di - Dj  # 相对论密度差（替换原rho差）
+            qijp = pi - pj
+            qiju = vr - vl
+
+            delr = rsi * RIJ
+            delrp = 2 * delr - qijD
+            delp = psi * RIJ
+            delpp = 2 * delp - qijp
+            delv = vsi * RIJ
+            delvp = 2 * delv - qiju
+
+            rsi = monotonicity_min(qijD, delr, delrp)/RIJ
+            psi = monotonicity_min(qijp, delp, delpp)/RIJ
+            vsi = monotonicity_min(qiju, delv, delvp)/RIJ
+
+            delr = rsj * RIJ
+            delrp = 2 * delr - qijD
+            delp = psj * RIJ
+            delpp = 2 * delp - qijp
+            delv = vsj * RIJ
+            delvp = 2 * delv - qiju
+
+            rsj = monotonicity_min(qijD, delr, delrp)/RIJ
+            psj = monotonicity_min(qijp, delp, delpp)/RIJ
+            vsj = monotonicity_min(qiju, delv, delvp)/RIJ
+        elif self.monotonicity == 2 and RIJ < 1e-14:
+            rsi = rsj = psi = psj = vsi = vsj = 0.0
+
+        # 9. 黎曼求解器输入（适配相对论密度D）
+        sstar *= 2.0
+
+        # 左/右状态密度（替换原rho为D）
+        rhol = Dj + 0.5 * rsj * RIJ * (1.0 - csj*dt*sij + sstar)
+        rhor = Di - 0.5 * rsi * RIJ * (1.0 - csi*dt*sij + sstar)
+        rhol = max(rhol, 1e-10) if rhol < 0 else rhol
+        rhor = max(rhor, 1e-10) if rhor < 0 else rhor
+
+        # 左/右状态压力（保留原逻辑）
+        pl = pj + 0.5 * psj * RIJ * (1.0 - csj*dt*sij + sstar)
+        pr = pi - 0.5 * psi * RIJ * (1.0 - csi*dt*sij + sstar)
+        pl = max(pl, 1e-10) if pl < 0 else pl
+        pr = max(pr, 1e-10) if pr < 0 else pr
+
+        # 左/右状态速度（保留原逻辑）
+        ul = vl + 0.5 * vsj * RIJ * (1.0 - csj*dt*sij + sstar)
+        ur = vr - 0.5 * vsi * RIJ * (1.0 - csi*dt*sij + sstar)
+
+        # 10. 相对论黎曼求解器（求解p*, u*，论文Eqs. (33)-(34)）
+        result = declare('matrix(2)')
+        riemann_solve(
+            self.rsolver, rhol, rhor, pl, pr, ul, ur,
+            self.gamma, self.niter, self.tol, result
+        )
+        pstar = result[0]
+        ustar = result[1]
+
+        # 混合格式（保留原逻辑）
+        if self.hybrid:
+            riemann_solve(
+                10, Dj, Di, pl, pr, vl, vr, self.gamma,
+                self.niter, self.tol, result
+            )
+            pstar2 = result[0]
+            ustar2 = result[1]
+            ustar = ustar + blending_factor * (ustar2 - ustar)
+            pstar = pstar + blending_factor * (pstar2 - pstar)
+
+        # 11. 三维速度（论文Eq. (24)）
+        vstar = declare('matrix(3)')
+        vstar[0] = ustar*eij[0]
+        vstar[1] = ustar*eij[1]
+        vstar[2] = ustar*eij[2]
+
+        # 12. 相对论动量加速度（论文Eq. (22a)）
+        mj = s_m[s_idx]
+        d_au[d_idx] += -mj * pstar * (vij_i * DWI[0] + vij_j * DWJ[0])
+        d_av[d_idx] += -mj * pstar * (vij_i * DWI[1] + vij_j * DWJ[1])
+        d_aw[d_idx] += -mj * pstar * (vij_i * DWI[2] + vij_j * DWJ[2])
+
+        # 13. 相对论能量加速度（论文Eq. (22b)）
+        vstardotdwi = vstar[0]*DWI[0] + vstar[1]*DWI[1] + vstar[2]*DWI[2]
+        vstardotdwj = vstar[0]*DWJ[0] + vstar[1]*DWJ[1] + vstar[2]*DWJ[2]
+        d_ae[d_idx] += -mj * pstar * (vij_i * vstardotdwi + vij_j * vstardotdwj)
+
+        # 14. 人工热传导（适配相对论能量e_hat）
+        if self.thermal_conduction:
+            divj = s_div[s_idx]
+            Hj = g1 * hj * csj + g2 * hj*hj * (abs(divj) - divj)
+            Hij = (Hi + Hj) * (d_e_hat[d_idx] - s_e_hat[s_idx])  # e_hat替换原e
+            Hij /= (RHOIJ * (RIJ*RIJ + EPS))
+            d_ae[d_idx] += mj*Hij*(XIJ[0]*DWIJ[0] + XIJ[1]*DWIJ[1] + XIJ[2]*DWIJ[2])
+
+    def interpolate(self, hi=0.0, hj=0.0, Di=0.0, Dj=0.0,
+                    sij=0.0, gri_eij=0.0, grj_eij=0.0,
+                    result=[0.0, 0.0, 0.0]):
+        """Interpolation for relativistic specific volume (V=1/D, D=ρΓ)."""
+        # 相对论比体积V=1/D（论文Eq. (3)）
+        Vi = 1./Di
+        Vj = 1./Dj
+
+        # 比体积梯度（dV/dx = -1/D² · ∇D）
+        Vip = -1./(Di*Di) * gri_eij
+        Vjp = -1./(Dj*Dj) * grj_eij
+
+        aij, bij, cij, dij, hij, vij, vij_i2, vij_j2 = declare('double', 8)
+        hij = 0.5 * (hi + hj)
+        sstar = self.sstar
+
+        # 0: 点插值（Vij²=1/D²）
+        if self.interpolation == 0:
+            vij_i2 = 1./(Di * Di)
+            vij_j2 = 1./(Dj * Dj)
+
+        # 1: 线性插值（适配相对论V=1/D）
+        elif self.interpolation == 1:
+            cij = 0.0 if sij < 1e-8 else (Vi - Vj)/sij
+            dij = 0.5 * (Vi + Vj)
+            vij_i2 = 0.25 * hi * hi * cij * cij + dij * dij
+            vij_j2 = 0.25 * hj * hj * cij * cij + dij * dij
+
+            if not self.interface_zero:
+                vij = 0.5 * (vij_i2 + vij_j2)
+                sstar = 0.5 * hij*hij * cij*dij/vij
+
+        # 2: 三次样条插值（适配相对论V=1/D）
+        elif self.interpolation == 2:
+            if sij < 1e-8:
+                aij = bij = cij = 0.0
+                dij = 0.5 * (Vi + Vj)
+            else:
+                aij = -2.0 * (Vi - Vj)/(sij*sij*sij) + (Vip + Vjp)/(sij*sij)
+                bij = 0.5 * (Vip - Vjp)/sij
+                cij = 1.5 * (Vi - Vj)/sij - 0.25 * (Vip + Vjp)
+                dij = 0.5 * (Vi + Vj) - 0.125*(Vip - Vjp)*sij
+
+            hi2 = hi*hi
+            hj2 = hj*hj
+            hi4 = hi2*hi2
+            hj4 = hj2*hj2
+            hi6 = hi4*hi2
+            hj6 = hj4*hj2
+
+            vij_i2 = ((15.0)/(64.0)*hi6 * aij*aij +
+                      (3.0)/(16.0) * hi4 * (2*aij*cij + bij*bij) +
+                      0.25*hi2*(2*bij*dij + cij*cij) + dij * dij)
+
+            vij_j2 = ((15.0)/(64.0)*hj6 * aij*aij +
+                      (3.0)/(16.0) * hj4 * (2*aij*cij + bij*bij) +
+                      0.25*hj2 * (2*bij*dij + cij*cij) + dij * dij)
+
+            if not self.interface_zero:
+                vij = 0.5*(vij_i2 + vij_j2)
+                sstar = ((15.0/32.0)*hij*hij*hij*hij*hij*aij*bij +
+                         (3.0/8.0)*hij*hij*hij*hij*(aij*dij + bij*cij) +
+                         0.5*hij*hij*cij*dij)/vij
+        else:
+            printf(b"%s", b"Unknown interpolation type")
+
+        result[0] = vij_i2
+        result[1] = vij_j2
+        result[2] = sstar

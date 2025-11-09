@@ -28,6 +28,15 @@ class UpdateSmoothingLengthFromVolume(Equation):
     def loop(self, d_idx, d_m, d_rho, d_h):
         d_h[d_idx] = self.k * pow(d_m[d_idx]/d_rho[d_idx], self.dim1)
 
+class UpdateSmoothingLengthFromVolume_rel(Equation):
+    def __init__(self, dest, sources, dim, k=1.2):
+        super(UpdateSmoothingLengthFromVolume, self).__init__(dest, sources)
+        self.k = k
+        self.dim1 = 1./dim
+
+    def loop(self, d_idx, d_m, d_D, d_h):
+        # ρ替换为相对论密度D，公式不变
+        d_h[d_idx] = self.k * pow(d_m[d_idx]/d_D[d_idx], self.dim1)
 
 class SummationDensityADKE(Equation):
     """
@@ -352,6 +361,200 @@ class ADKEAccelerations(Equation):
         xijdotdwij = XIJ[0]*DWIJ[0] + XIJ[1]*DWIJ[1] + XIJ[2]*DWIJ[2]
         d_ae[d_idx] += 0.5*mj*(tmpv*vijdotdwij + 2*xijdotdwij*Hij)
 
+class SummationDensity_rel(Equation):
+    def __init__(self, dest, sources, dim, density_iterations=False,
+                 iterate_only_once=False, k=1.2, htol=1e-6):
+        r"""Summation density with iterative solution of the smoothing lengths.
+
+        Parameters:
+
+        density_iterations : bint
+            Flag to indicate density iterations are required.
+
+        iterate_only_once : bint
+            Flag to indicate if only one iteration is required
+
+        k : double
+            Kernel scaling factor
+
+        htol : double
+            Iteration tolerance
+
+        """
+        self.density_iterations = density_iterations
+        self.iterate_only_once = iterate_only_once
+        self.dim = dim
+        self.k = k
+        self.htol = htol
+
+        self.equation_has_converged = 1
+
+        super(SummationDensity_rel, self).__init__(dest, sources)
+
+    def initialize(self, d_idx, d_D, d_div, d_grhox, d_grhoy, d_grhoz,
+                   d_arho, d_dwdh):
+        d_D[d_idx] = 0.0
+        d_div[d_idx] = 0.0
+
+        d_grhox[d_idx] = 0.0
+        d_grhoy[d_idx] = 0.0
+        d_grhoz[d_idx] = 0.0
+        d_arho[d_idx] = 0.0
+
+        d_dwdh[d_idx] = 0.0
+
+        self.equation_has_converged = 1 
+
+    def loop(self, d_idx, s_idx, d_D, d_grhox, d_grhoy, d_grhoz, d_arho,
+             d_dwdh, s_m, d_converged, VIJ, WI, DWI, GHI):
+        mj = s_m[s_idx]
+        vijdotdwij = VIJ[0]*DWI[0] + VIJ[1]*DWI[1] + VIJ[2]*DWI[2]
+
+        d_D[d_idx] += mj * WI
+        d_arho[d_idx] += mj * vijdotdwij
+
+        d_grhox[d_idx] += mj * DWI[0]
+        d_grhoy[d_idx] += mj * DWI[1]
+        d_grhoz[d_idx] += mj * DWI[2]
+
+        d_dwdh[d_idx] += mj * GHI
+
+    def post_loop(self, d_idx, d_arho, d_D, d_div, d_omega, d_dwdh,
+                  d_h0, d_h, d_m, d_ah, d_converged):
+        if self.density_iterations:
+            if not (d_converged[d_idx] == 1):
+                mi = d_m[d_idx]
+                hi = d_h[d_idx]
+                hi0 = d_h0[d_idx]
+
+                rhoi = mi/(hi/self.k)**self.dim
+                dhdrhoi = -hi/(self.dim*d_D[d_idx])
+                dwdhi = d_dwdh[d_idx]
+                omegai = 1.0 - dhdrhoi*dwdhi
+
+                if omegai < 0:
+                    omegai = 1.0
+
+                gradhi = 1.0/omegai
+                d_omega[d_idx] = gradhi
+
+                func = rhoi - d_D[d_idx]
+                dfdh = omegai/dhdrhoi
+
+                hnew = hi - func/dfdh
+
+                if (hnew > 1.2 * hi):
+                    hnew = 1.2 * hi
+                elif (hnew < 0.8 * hi):
+                    hnew = 0.8 * hi
+
+                if ((hnew <= 1e-6) or (gradhi < 1e-6)):
+                    hnew = self.k * (mi/d_D[d_idx])**(1./self.dim)
+
+                diff = abs(hnew - hi)/hi0
+
+                if not ((diff < self.htol) and (omegai > 0) or
+                        self.iterate_only_once):
+                    self.equation_has_converged = -1
+                    d_h[d_idx] = hnew
+                    d_converged[d_idx] = 0
+                else:
+                    d_arho[d_idx] *= d_omega[d_idx]
+                    d_ah[d_idx] = d_arho[d_idx] * dhdrhoi
+                    d_converged[d_idx] = 1
+
+        d_div[d_idx] = -d_arho[d_idx]/d_D[d_idx]
+
+    def converged(self):
+        return self.equation_has_converged
+
+
+class IdealGasEOS_rel(Equation):
+    def __init__(self, dest, sources, gamma):
+        self.gamma = gamma
+        self.gamma1 = gamma - 1.0
+        super(IdealGasEOS_rel, self).__init__(dest, sources)
+
+    def loop(self, d_idx, d_p, d_D, d_e, d_cs):
+        d_p[d_idx] = self.gamma1 * d_D[d_idx] * d_e[d_idx]
+        d_cs[d_idx] = sqrt(self.gamma * d_p[d_idx]/d_D[d_idx])
+
+
+class RelativisticEOS_rel(Equation):
+    def __init__(self, dest, sources, gamma=4.0/3.0, chi=1.0):
+        """Relativistic equation of state
+        
+        Parameters:
+        gamma : float
+            Ratio of specific heats (default 4/3 for relativistic gas)
+        chi : float
+            Rest mass density coefficient
+        """
+        self.gamma = gamma
+        self.gamma1 = gamma - 1.0
+        self.chi = chi
+        super(RelativisticEOS_rel, self).__init__(dest, sources)
+
+    def initialize(self, d_idx, d_p, d_D, d_e, d_cs, d_hhat, d_Gamma):
+        d_p[d_idx] = 0.0
+        d_cs[d_idx] = 0.0
+        d_hhat[d_idx] = 0.0
+        d_Gamma[d_idx] = 0.0
+
+    def loop(self, d_idx, d_p, d_D, d_e, d_cs, d_hhat, d_Gamma, d_u, d_v, d_w):
+        hhat = 1.0 + d_e[d_idx] + d_p[d_idx]/d_D[d_idx]
+        d_hhat[d_idx] = hhat
+        
+        v_sq = (d_u[d_idx]**2 + d_v[d_idx]**2 + d_w[d_idx]**2)
+        Gamma = 1.0/sqrt(1.0 - v_sq) if v_sq < 1.0 else 1.0
+        d_Gamma[d_idx] = Gamma
+        
+        D = d_D[d_idx]
+        ehat = hhat*Gamma - self.chi
+        d_p[d_idx] = self.gamma1 * D * ehat
+        
+        c_sq = self.gamma * d_p[d_idx] / (D * hhat)
+        d_cs[d_idx] = sqrt(c_sq) if c_sq > 0 else 0.0
+
+
+class RelativisticMomentumEquation_rel(Equation):
+    def __init__(self, dest, sources, alpha=1.0, beta=2.0):
+        self.alpha = alpha
+        self.beta = beta
+        super(RelativisticMomentumEquation_rel, self).__init__(dest, sources)
+
+    def initialize(self, d_idx, d_au, d_av, d_aw, d_ae):
+        d_au[d_idx] = 0.0
+        d_av[d_idx] = 0.0
+        d_aw[d_idx] = 0.0
+        d_ae[d_idx] = 0.0
+
+    def loop(self, d_idx, s_idx, d_D, s_D, d_p, s_p, d_cs, s_cs,
+             d_au, d_av, d_aw, d_ae, s_m, d_hhat, s_hhat, d_Gamma, s_Gamma,
+             VIJ, DWIJ, XIJ, EPS, HIJ, R2IJ, RHOIJ1):
+        hi = d_hhat[d_idx]
+        hj = s_hhat[s_idx]
+        Gi = d_Gamma[d_idx]
+        Gj = s_Gamma[s_idx]
+        
+        term_i = d_p[d_idx] / (d_D[d_idx] * hi * Gi)
+        term_j = s_p[s_idx] / (s_D[s_idx] * hj * Gj)
+
+        vijdotxij = VIJ[0]*XIJ[0] + VIJ[1]*XIJ[1] + VIJ[2]*XIJ[2]
+        piij = 0.0
+        if vijdotxij < 0:
+            muij = HIJ*vijdotxij/(R2IJ + EPS)
+            cij = 0.5 * (d_cs[d_idx] + s_cs[s_idx])
+            piij = -self.alpha*cij*muij + self.beta*muij*muij
+            piij *= RHOIJ1
+
+        accel_term = (term_i + term_j + piij)
+        d_au[d_idx] += -s_m[s_idx] * accel_term * DWIJ[0]
+        d_av[d_idx] += -s_m[s_idx] * accel_term * DWIJ[1]
+        d_aw[d_idx] += -s_m[s_idx] * accel_term * DWIJ[2]
+
+        vijdotdwij = VIJ[0]*DWIJ[0] + VIJ[1]*DWIJ[1] + VIJ[2]*DWIJ[2]
+        d_ae[d_idx] += 0.5 * s_m[s_idx] * accel_term * vijdotdwij * Gi
 
 class MPMAccelerations(Equation):
     def __init__(self, dest, sources, beta=2.0, update_alpha1=False,
