@@ -38,8 +38,9 @@ class ShockTubeSetup_rel(Application):
             p = (pl - pr) / (1 + numpy.exp((x - x0) / deltax)) + pr
             u = (ul - ur) / (1 + numpy.exp((x - x0) / deltax)) + ur
             rho = (rhol - rhor) / (1 + numpy.exp((x - x0) / deltax)) + rhor
-            gamma = 1.0 / numpy.sqrt(1 - numpy.clip(u**2 / self.c**2, 0, 0.999))
-            D = rho * gamma
+            # 修改: 洛伦兹因子变量名改为 Gamma
+            Gamma = 1.0 / numpy.sqrt(1 - numpy.clip(u**2 / self.c**2, 0, 0.999))
+            D = rho * Gamma
         else:
             rho = numpy.ones_like(x) * rhol
             rho[right_indices] = rhor
@@ -47,11 +48,12 @@ class ShockTubeSetup_rel(Application):
             p[right_indices] = pr
             u = numpy.ones_like(x) * ul
             u[right_indices] = ur
-            gamma_left = 1.0 / numpy.sqrt(1 - numpy.clip(ul**2 / self.c**2, 0, 0.999))
-            gamma_right = 1.0 / numpy.sqrt(1 - numpy.clip(ur**2 / self.c**2, 0, 0.999))
-            gamma = numpy.ones_like(x) * gamma_left
-            gamma[right_indices] = gamma_right
-            D = rho * gamma
+            # 修改: 洛伦兹因子变量名改为 Gamma_left, Gamma_right, Gamma
+            Gamma_left = 1.0 / numpy.sqrt(1 - numpy.clip(ul**2 / self.c**2, 0, 0.999))
+            Gamma_right = 1.0 / numpy.sqrt(1 - numpy.clip(ur**2 / self.c**2, 0, 0.999))
+            Gamma = numpy.ones_like(x) * Gamma_left
+            Gamma[right_indices] = Gamma_right
+            D = rho * Gamma
 
         dx = numpy.ones_like(x) * dxl
         dx[right_indices] = dxr
@@ -69,8 +71,9 @@ class ShockTubeSetup_rel(Application):
 
         bwij = numpy.ones_like(b)
         rho_b = numpy.ones_like(b)
-        gamma_b = 1.0 / numpy.sqrt(1 - numpy.clip(ul**2 / self.c**2, 0, 0.999))
-        D_b = rho_b * gamma_b
+        # 修改: 边界粒子的洛伦兹因子变量名改为 Gamma_b
+        Gamma_b = 1.0 / numpy.sqrt(1 - numpy.clip(ul**2 / self.c**2, 0, 0.999))
+        D_b = rho_b * Gamma_b
         bp = numpy.ones_like(b)
         be = bp / (gamma1 * rho_b)
         bm = numpy.ones_like(b) * dxl
@@ -79,13 +82,13 @@ class ShockTubeSetup_rel(Application):
         
         fluid = gpa(
             constants=constants, name='fluid', x=x, rho=rho,
-            D=D, gamma=gamma,
+            D=D, gamma=Gamma,  # 修改: 这里现在明确是洛伦兹因子 Gamma
             p=p, e=e, h=h, m=m, u=u, wij=wij, h0=h.copy()
         )
 
         boundary = gpa(
             constants=constants, name='boundary', x=b, rho=rho_b,
-            D=D_b, gamma=gamma_b,
+            D=D_b, gamma=Gamma_b, # 修改: 这里现在明确是洛伦兹因子 Gamma_b
             p=bp, e=be, h=bh, m=bm, wij=bwij, h0=bh.copy(), htmp=bhtmp
         )
 
@@ -109,6 +112,7 @@ class ShockTubeSetup_rel(Application):
         from pysph.solver.utils import load
         data = load(last_output)
         pa = data['arrays']['fluid']
+        # 这里的 gamma 是绝热指数，保持不变
         gamma = self.options.gamma if self.options.gamma else 1.4
         riemann_solver.set_gamma(gamma)
 
@@ -117,14 +121,16 @@ class ShockTubeSetup_rel(Application):
             t=self.tf, p_l=self.pl, p_r=self.pr, rho_l=self.rhol,
             rho_r=self.rhor, u_l=self.ul, u_r=self.ur, N=101
         )
-        gamma_e = 1.0 / numpy.sqrt(1 - numpy.clip(u_e**2 / self.c**2, 0, 0.999))
-        D_e = rho_e * gamma_e
+        # 修改: 精确解的洛伦兹因子变量名改为 Gamma_e
+        Gamma_e = 1.0 / numpy.sqrt(1 - numpy.clip(u_e**2 / self.c**2, 0, 0.999))
+        D_e = rho_e * Gamma_e
 
         x = pa.x
         D = pa.D
         rho = pa.rho
         e = pa.e
         h_rel = 1 + e + pa.p / rho
+        # 这里的 gamma 是绝热指数，用于声速计算，保持不变
         cs = self.c * numpy.sqrt(gamma * pa.p / (D * h_rel))
         u = pa.u
         p = pa.p
@@ -167,10 +173,12 @@ class ShockTubeSetup_rel(Application):
         plt.clf()
 
         fname = os.path.join(self.output_dir, 'results.npz')
+        # 修改: 保存的洛伦兹因子变量名改为 Gamma
         numpy.savez(fname, x=x, u=u, e=e, cs=cs, rho=rho, D=D, gamma=pa.gamma, p=p, h=h)
 
         fname = os.path.join(self.output_dir, 'exact.npz')
-        numpy.savez(fname, x=x_e, u=u_e, e=e_e, p=p_e, rho=rho_e, D=D_e, gamma=gamma_e)
+        # 修改: 保存的精确解洛伦兹因子变量名改为 Gamma_e
+        numpy.savez(fname, x=x_e, u=u_e, e=e_e, p=p_e, rho=rho_e, D=D_e, gamma=Gamma_e)
 
     def configure_scheme(self):
         s = self.scheme
